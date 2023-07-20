@@ -39,8 +39,10 @@ import io.trino.testing.TestingConnectorContext;
 import io.trino.testing.TestingConnectorSession;
 import org.testng.annotations.Test;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 
@@ -153,6 +155,64 @@ public class TestDeltaLakeSplitManager
         assertEquals(splits, expected);
     }
 
+    @Test
+    public void testMergeTwoFiles()
+    {
+        assertEquals(
+                Set.of("root/p1=a/p2=b/tmp1", "root/p1=a/p2=b/tmp2"),
+                DeltaLakeSplitManager.mergeablePaths(3, ImmutableList.of(
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp1", 1),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp2", 1))));
+    }
+
+    @Test
+    public void testMergeNoFiles()
+    {
+        assertEquals(
+                Collections.emptySet(),
+                DeltaLakeSplitManager.mergeablePaths(3, ImmutableList.of(
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp1", 1))));
+    }
+
+    @Test
+    public void testMergePartitionWithThreeFiles()
+    {
+        assertEquals(
+                Set.of("root/p1=a/p2=b/tmp1", "root/p1=a/p2=b/tmp2"),
+                DeltaLakeSplitManager.mergeablePaths(3, ImmutableList.of(
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp1", 1),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp2", 1),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp3", 2))));
+    }
+
+    @Test
+    public void testMergeMultiplePartitions()
+    {
+        assertEquals(
+                Set.of("root/p1=a/p2=b/tmp1", "root/p1=a/p2=b/tmp2",
+                        "root/p1=a/p2=c/tmp1", "root/p1=a/p2=c/tmp2"),
+                DeltaLakeSplitManager.mergeablePaths(3, ImmutableList.of(
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=c/tmp1", 2),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=c/tmp2", 1),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp1", 1),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp2", 1))));
+    }
+
+    @Test
+    public void testMergeMultiplePartitionsSkipFile()
+    {
+        assertEquals(
+                Set.of("root/p1=a/p2=b/tmp1", "root/p1=a/p2=b/tmp2",
+                        "root/p1=a/p2=c/tmp1", "root/p1=a/p2=c/tmp2"),
+                DeltaLakeSplitManager.mergeablePaths(3, ImmutableList.of(
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=c/tmp1", 2),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=c/tmp2", 1),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=c/tmp3", 3),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp1", 1),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp2", 1),
+                        addFileEntryOfPartitionAndSize("root/p1=a/p2=b/tmp3", 3))));
+    }
+
     private DeltaLakeSplitManager setupSplitManager(List<AddFileEntry> addFileEntries, DeltaLakeConfig deltaLakeConfig)
     {
         TestingConnectorContext context = new TestingConnectorContext();
@@ -182,6 +242,11 @@ public class TestDeltaLakeSplitManager
     private AddFileEntry addFileEntryOfSize(long fileSize)
     {
         return new AddFileEntry(FILE_PATH, ImmutableMap.of(), fileSize, 0, false, Optional.empty(), Optional.empty(), ImmutableMap.of());
+    }
+
+    private AddFileEntry addFileEntryOfPartitionAndSize(String path, long fileSize)
+    {
+        return new AddFileEntry(path, ImmutableMap.of(), fileSize, 0, false, Optional.empty(), Optional.empty(), ImmutableMap.of());
     }
 
     private DeltaLakeSplit makeSplit(long start, long splitSize, long fileSize, double minimumAssignedSplitWeight)

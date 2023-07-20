@@ -13,6 +13,7 @@
  */
 package io.trino.plugin.deltalake;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import io.airlift.units.DataSize;
 import io.trino.filesystem.TrinoFileSystemFactory;
@@ -45,6 +46,11 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -138,6 +144,38 @@ public class DeltaLakeSplitManager
         throw new UnsupportedOperationException("Unrecognized function: " + function);
     }
 
+    /**
+     * For each partition, divide the partition into bins of files of size up to maxSize. E.g., if maxSize = 100 MB, the partition contains one 100 MB file and one 50 MB file, we
+     * do not reprocess the 50 MB file.
+     * Inspired by https://github.com/delta-io/delta/blob/48040a58ab9ed9a04534ac50c1676147f7c071be/core/src/main/scala/org/apache/spark/sql/delta/commands/OptimizeTableCommand.scala#L283
+     */
+    @VisibleForTesting
+    public static Set<String> mergeablePaths(long maxSize, List<AddFileEntry> validDataFiles)
+    {
+        Set<String> binMergeable = new HashSet<>();
+        Iterator<AddFileEntry> it = validDataFiles.stream().sorted(Comparator.comparing(AddFileEntry::getPath)).iterator();
+        List<String> currentBin = new ArrayList<>();
+        long currentBinSize = 0;
+        Map<String, Optional<String>> currentPartitionValues = null;
+        while (it.hasNext()) {
+            AddFileEntry entry = it.next();
+            if (currentBinSize + entry.getSize() > maxSize || entry.getCanonicalPartitionValues() != currentPartitionValues) {
+                if (currentBin.size() > 1) {
+                    binMergeable.addAll(currentBin);
+                }
+                currentBin.clear();
+                currentBinSize = 0;
+                currentPartitionValues = entry.getCanonicalPartitionValues();
+            }
+            currentBin.add(entry.getPath());
+            currentBinSize += entry.getSize();
+        }
+        if (currentBin.size() > 1) {
+            binMergeable.addAll(currentBin);
+        }
+        return binMergeable;
+    }
+
     private Stream<DeltaLakeSplit> getSplits(
             DeltaLakeTableHandle tableHandle,
             ConnectorSession session,
@@ -178,6 +216,14 @@ public class DeltaLakeSplitManager
                 .filter(column -> predicatedColumnNames.contains(column.getName())) // DeltaLakeColumnMetadata.name is lowercase
                 .collect(toImmutableList());
 
+        Set<String> mergeable;
+        if (maxScannedFileSizeInBytes.isPresent()) {
+            mergeable = mergeablePaths(maxScannedFileSizeInBytes.orElseThrow(), validDataFiles);
+        }
+        else {
+            mergeable = Collections.emptySet();
+        }
+
         return validDataFiles.stream()
                 .flatMap(addAction -> {
                     if (tableHandle.getAnalyzeHandle().isPresent() && !tableHandle.getAnalyzeHandle().get().isInitialAnalyze() && !addAction.isDataChange()) {
@@ -195,6 +241,10 @@ public class DeltaLakeSplitManager
                     }
 
                     if (maxScannedFileSizeInBytes.isPresent() && addAction.getSize() > maxScannedFileSizeInBytes.get()) {
+                        return Stream.empty();
+                    }
+
+                    if (!mergeable.contains(addAction.getPath())) {
                         return Stream.empty();
                     }
 
