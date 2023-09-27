@@ -62,15 +62,20 @@ class EvictableCache<K, V>
     // Invariant: for every (K, token) entry in the tokens map, there is a live
     // cache entry (token, ?) in dataCache, that, upon eviction, will cause the tokens'
     // entry to be removed.
-    private final ConcurrentHashMap<K, Token<K>> tokens = new ConcurrentHashMap<>();
+    protected final ConcurrentMap<K, Token<K>> tokens;
     // The dataCache can have entries with no corresponding tokens in the tokens map.
     // For example, this can happen when invalidation concurs with load.
     // The dataCache must be bounded.
-    private final LoadingCache<Token<K>, V> dataCache;
+    protected final LoadingCache<Token<K>, V> dataCache;
 
     private final AtomicInteger invalidations = new AtomicInteger();
 
-    EvictableCache(CacheBuilder<? super Token<K>, ? super V> cacheBuilder, CacheLoader<? super K, V> cacheLoader)
+    protected EvictableCache(CacheBuilder<? super Token<K>, ? super V> cacheBuilder, CacheLoader<? super K, V> cacheLoader)
+    {
+        this(cacheBuilder, cacheLoader, new ConcurrentHashMap<>());
+    }
+
+    protected EvictableCache(CacheBuilder<? super Token<K>, ? super V> cacheBuilder, CacheLoader<? super K, V> cacheLoader, ConcurrentMap<K, Token<K>> tokens)
     {
         dataCache = buildUnsafeCache(
                 cacheBuilder
@@ -82,6 +87,7 @@ class EvictableCache<K, V>
                             }
                         }),
                 new TokenCacheLoader<>(cacheLoader));
+        this.tokens = tokens;
     }
 
     @SuppressModernizer // CacheBuilder.build(CacheLoader) is forbidden, advising to use this class as a safety-adding wrapper.

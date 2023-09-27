@@ -23,6 +23,7 @@ import com.google.common.util.concurrent.UncheckedExecutionException;
 import com.google.inject.Inject;
 import io.airlift.jmx.CacheStatsMBean;
 import io.trino.cache.EvictableCacheBuilder;
+import io.trino.cache.SortedEvictableCache;
 import io.trino.filesystem.Location;
 import io.trino.filesystem.TrinoFileSystem;
 import io.trino.filesystem.TrinoFileSystemFactory;
@@ -99,7 +100,7 @@ public class TransactionLogAccess
     private final int domainCompactionThreshold;
 
     private final Cache<TableLocation, TableSnapshot> tableSnapshots;
-    private final Cache<TableVersion, DeltaLakeDataFileCacheEntry> activeDataFileCache;
+    private final SortedEvictableCache<TableVersion, DeltaLakeDataFileCacheEntry> activeDataFileCache;
 
     // TODO move to query-level state
     private final Map<QueriedLocation, Long> queriedLocations = new ConcurrentHashMap<>();
@@ -134,7 +135,7 @@ public class TransactionLogAccess
                 .expireAfterWrite(deltaLakeConfig.getDataFileCacheTtl().toMillis(), TimeUnit.MILLISECONDS)
                 .shareNothingWhenDisabled()
                 .recordStats()
-                .build();
+                .buildSorted();
     }
 
     @Managed
@@ -261,16 +262,9 @@ public class TransactionLogAccess
             TableVersion tableVersion = new TableVersion(new TableLocation(tableSnapshot.getTable(), tableSnapshot.getTableLocation()), tableSnapshot.getVersion());
 
             DeltaLakeDataFileCacheEntry cacheEntry = activeDataFileCache.get(tableVersion, () -> {
-                DeltaLakeDataFileCacheEntry oldCached = activeDataFileCache.asMap().keySet().stream()
-                        .filter(key -> key.tableLocation().equals(tableVersion.tableLocation()) &&
-                                key.version() < tableVersion.version())
-                        .flatMap(key -> Optional.ofNullable(activeDataFileCache.getIfPresent(key))
-                                .map(value -> Map.entry(key, value))
-                                .stream())
-                        .max(Comparator.comparing(entry -> entry.getKey().version()))
-                        .map(Map.Entry::getValue)
-                        .orElse(null);
-                if (oldCached != null) {
+                Map.Entry<TableVersion, DeltaLakeDataFileCacheEntry> oldEntry = activeDataFileCache.floorEntryIfNotEvicted(tableVersion);
+                if (oldEntry != null && tableVersion.tableLocation == oldEntry.getKey().tableLocation()) {
+                    DeltaLakeDataFileCacheEntry oldCached = oldEntry.getValue();
                     try {
                         List<DeltaLakeTransactionLogEntry> newEntries = getJsonEntries(
                                 oldCached.getVersion(),
@@ -572,8 +566,10 @@ public class TransactionLogAccess
     }
 
     private record TableVersion(TableLocation tableLocation, long version)
+            implements Comparable<TableVersion>
     {
         private static final int INSTANCE_SIZE = instanceSize(TableVersion.class);
+        private static final Comparator<TableVersion> comparator = Comparator.<TableVersion, String>comparing(t -> t.tableLocation.location, String::compareTo).thenComparingLong(t -> t.version);
 
         TableVersion
         {
@@ -584,6 +580,12 @@ public class TransactionLogAccess
         {
             return INSTANCE_SIZE +
                     tableLocation.getRetainedSizeInBytes();
+        }
+
+        @Override
+        public int compareTo(TransactionLogAccess.TableVersion tableVersion)
+        {
+            return comparator.compare(this, tableVersion);
         }
     }
 

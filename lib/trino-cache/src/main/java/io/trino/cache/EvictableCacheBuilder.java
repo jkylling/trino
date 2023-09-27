@@ -177,28 +177,47 @@ public final class EvictableCacheBuilder<K, V>
     public <K1 extends K, V1 extends V> LoadingCache<K1, V1> build(CacheLoader<? super K1, V1> loader)
     {
         if (cacheDisabled()) {
-            // Silently providing a behavior different from Guava's could be surprising, so require explicit choice.
-            DisabledCacheImplementation disabledCacheImplementation = this.disabledCacheImplementation.orElseThrow(() -> new IllegalStateException(
-                    "Even when cache is disabled, the loads are synchronized and both load results and failures are shared between threads. " +
-                            "This is rarely desired, thus builder caller is expected to either opt-in into this behavior with shareResultsAndFailuresEvenIfDisabled(), " +
-                            "or choose not to share results (and failures) between concurrent invocations with shareNothingWhenDisabled()."));
-            switch (disabledCacheImplementation) {
-                case NOOP:
-                    return new EmptyCache<>(loader, recordStats);
-                case GUAVA:
-                    // Disabled cache is always empty, so doesn't exhibit invalidation problems.
-                    // Avoid overhead of EvictableCache wrapper.
-                    CacheBuilder<Object, Object> cacheBuilder = CacheBuilder.newBuilder()
-                            .maximumSize(0)
-                            .expireAfterWrite(0, SECONDS);
-                    if (recordStats) {
-                        cacheBuilder.recordStats();
-                    }
-                    return buildUnsafeCache(cacheBuilder, loader);
-            }
-            throw new UnsupportedOperationException("Unsupported option: " + disabledCacheImplementation);
+            return buildDisabledCache(loader);
         }
+        return new EvictableCache<>(buildCacheBuilder(), loader);
+    }
 
+    @CheckReturnValue
+    public <K1 extends Comparable<K1>, V1 extends V> SortedEvictableCache<K1, V1> buildSorted()
+    {
+        if (cacheDisabled()) {
+            throw new IllegalArgumentException("not supported");
+        }
+        return new SortedEvictableCache<>(buildCacheBuilder(), unimplementedCacheLoader());
+    }
+
+    private <K1 extends K, V1 extends V> LoadingCache<K1, V1> buildDisabledCache(CacheLoader<? super K1, V1> loader)
+    {
+        // Silently providing a behavior different from Guava's could be surprising, so require explicit choice.
+        DisabledCacheImplementation disabledCacheImplementation = this.disabledCacheImplementation.orElseThrow(() -> new IllegalStateException(
+                "Even when cache is disabled, the loads are synchronized and both load results and failures are shared between threads. " +
+                        "This is rarely desired, thus builder caller is expected to either opt-in into this behavior with shareResultsAndFailuresEvenIfDisabled(), " +
+                        "or choose not to share results (and failures) between concurrent invocations with shareNothingWhenDisabled()."));
+        switch (disabledCacheImplementation) {
+            case NOOP:
+                return new EmptyCache<>(loader, recordStats);
+            case GUAVA:
+                // Disabled cache is always empty, so doesn't exhibit invalidation problems.
+                // Avoid overhead of EvictableCache wrapper.
+                CacheBuilder<Object, Object> cacheBuilder = CacheBuilder.newBuilder()
+                        .maximumSize(0)
+                        .expireAfterWrite(0, SECONDS);
+                if (recordStats) {
+                    cacheBuilder.recordStats();
+                }
+                return buildUnsafeCache(cacheBuilder, loader);
+        }
+        throw new UnsupportedOperationException("Unsupported option: " + disabledCacheImplementation);
+    }
+
+    @CheckReturnValue
+    private CacheBuilder<Object, ? super V> buildCacheBuilder()
+    {
         if (!(maximumSize.isPresent() || maximumWeight.isPresent() || expireAfterWrite.isPresent())) {
             // EvictableCache invalidation (e.g. invalidateAll) happening concurrently with a load may
             // lead to an entry remaining in the cache, without associated token. This would lead to
@@ -218,7 +237,7 @@ public final class EvictableCacheBuilder<K, V>
         if (recordStats) {
             cacheBuilder.recordStats();
         }
-        return new EvictableCache<>(cacheBuilder, loader);
+        return cacheBuilder;
     }
 
     private boolean cacheDisabled()
