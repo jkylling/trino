@@ -196,6 +196,38 @@ final class S3FileSystem
     }
 
     @Override
+    public FileIterator listFilesAfter(Location location, Location startAfter)
+            throws IOException
+    {
+        if (!(startAfter.path().startsWith(location.path()))) {
+            throw new IllegalArgumentException();
+        }
+        S3Location s3Location = new S3Location(location);
+        S3Location s3StartAfter = new S3Location(startAfter);
+
+        String key = s3Location.key();
+        if (!key.isEmpty() && !key.endsWith("/")) {
+            key += "/";
+        }
+
+        ListObjectsV2Request request = ListObjectsV2Request.builder()
+                .bucket(s3Location.bucket())
+                .prefix(key)
+                .startAfter(s3StartAfter.key())
+                .build();
+
+        try {
+            Iterator<S3Object> iterator = client.listObjectsV2Paginator(request).contents().stream()
+                    .filter(object -> !object.key().endsWith("/"))
+                    .iterator();
+            return new S3FileIterator(s3Location, iterator);
+        }
+        catch (SdkException e) {
+            throw new IOException("Failed to list location: " + location, e);
+        }
+    }
+
+    @Override
     public Optional<Boolean> directoryExists(Location location)
             throws IOException
     {
