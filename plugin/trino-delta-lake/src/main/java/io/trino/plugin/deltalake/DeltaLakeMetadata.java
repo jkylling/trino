@@ -102,9 +102,11 @@ import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTableLayout;
 import io.trino.spi.connector.ConnectorTableMetadata;
 import io.trino.spi.connector.ConnectorTableProperties;
+import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.ConnectorViewDefinition;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
+import io.trino.spi.connector.PointerType;
 import io.trino.spi.connector.ProjectionApplicationResult;
 import io.trino.spi.connector.RetryMode;
 import io.trino.spi.connector.RowChangeParadigm;
@@ -474,7 +476,10 @@ public class DeltaLakeMetadata
             if (atVersion.isPresent()) {
                 long version = atVersion.get();
                 TableSnapshot snapshot = queriedSnapshots.get(new QueriedTable(table, version));
-                checkState(snapshot != null, "No previously loaded snapshot found for query %s, table %s [%s] at version %s", session.getQueryId(), table, tableLocation, version);
+                if (snapshot == null) {
+                    snapshot = transactionLogAccess.loadSnapshot(session, table, tableLocation, atVersion);
+                }
+                //checkState(snapshot != null, "No previously loaded snapshot found for query %s, table %s [%s] at version %s", session.getQueryId(), table, tableLocation, version);
                 return snapshot;
             }
 
@@ -535,6 +540,19 @@ public class DeltaLakeMetadata
     @Override
     public LocatedTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName)
     {
+        return getTableHandle(session, tableName, Optional.empty(), Optional.empty());
+    }
+
+    @Override
+    public LocatedTableHandle getTableHandle(
+            ConnectorSession session,
+            SchemaTableName tableName,
+            Optional<ConnectorTableVersion> startVersion,
+            Optional<ConnectorTableVersion> endVersion)
+    {
+        if (startVersion.isPresent()) {
+            throw new TrinoException(NOT_SUPPORTED, "Read table with start version is not supported");
+        }
         requireNonNull(tableName, "tableName is null");
         if (!DeltaLakeTableName.isDataTable(tableName.getTableName())) {
             // Pretend the table does not exist to produce better error message in case of table redirects to Hive
@@ -545,6 +563,18 @@ public class DeltaLakeMetadata
             return null;
         }
         boolean managed = table.get().managed();
+
+        Optional<Long> atVersion = Optional.empty();
+        if (endVersion.isPresent()) {
+            ConnectorTableVersion version = endVersion.orElseThrow();
+            if (version.getPointerType() != PointerType.TARGET_ID) {
+                throw new TrinoException(NOT_SUPPORTED, format("Version pointer type is not supported: %s", version.getPointerType()));
+            }
+            if (version.getVersionType() != BIGINT && version.getVersionType() != INTEGER) {
+                throw new TrinoException(NOT_SUPPORTED, format("Unsupported type for table version: %s", version.getVersionType()));
+            }
+            atVersion = Optional.of((Long) version.getVersion());
+        }
 
         String tableLocation = table.get().location();
         TableSnapshot tableSnapshot = getSnapshot(session, tableName, tableLocation, Optional.empty());

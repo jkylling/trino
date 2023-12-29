@@ -54,6 +54,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.function.BiConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static com.google.common.base.Strings.repeat;
 import static com.google.common.base.Verify.verify;
@@ -2324,6 +2326,22 @@ public abstract class BaseDeltaLakeConnectorSmokeTest
             executor.shutdownNow();
             assertTrue(executor.awaitTermination(10, SECONDS));
         }
+    }
+
+    @Test
+    public void testAtVersion()
+    {
+        assertUpdate("DROP TABLE IF EXISTS test_at_version");
+        assertUpdate("CREATE TABLE test_at_version(key integer) with (checkpoint_interval = 2)");
+        for (int i = 1; i < 10; i++) {
+            assertUpdate("INSERT INTO test_at_version VALUES " + i, 1);
+        }
+        assertQueryReturnsEmptyResult("SELECT * FROM test_at_version FOR VERSION AS OF 0");
+        for (int i = 1; i < 10; i++) {
+            assertQuery("SELECT * FROM test_at_version FOR VERSION AS OF " + i,
+                    "VALUES " + IntStream.range(1, i + 1).boxed().map(Object::toString).collect(Collectors.joining(", ")));
+        }
+        assertQueryFails("SELECT * FROM test_at_version FOR VERSION AS OF 10", "Error getting snapshot for smoke_test.test_at_version");
     }
 
     protected List<String> listCheckpointFiles(String transactionLogDirectory)

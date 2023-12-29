@@ -71,6 +71,9 @@ public class TransactionLogTail
 
         long version = startVersion.orElse(0L);
         long entryNumber = startVersion.map(start -> start + 1).orElse(0L);
+        if (endVersion.isPresent() && entryNumber == endVersion.get() + 1) {
+            return new TransactionLogTail(ImmutableList.of(), endVersion.get(), Optional.empty(), Optional.empty());
+        }
         checkArgument(endVersion.isEmpty() || entryNumber <= endVersion.get(), "Invalid start/end versions: %s, %s", startVersion, endVersion);
 
         String transactionLogDir = getTransactionLogDir(tableLocation);

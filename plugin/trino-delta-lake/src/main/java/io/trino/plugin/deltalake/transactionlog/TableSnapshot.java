@@ -105,6 +105,33 @@ public class TableSnapshot
                 domainCompactionThreshold);
     }
 
+    public static TableSnapshot load(
+            SchemaTableName table,
+            Optional<LastCheckpoint> lastCheckpoint,
+            TrinoFileSystem fileSystem,
+            String tableLocation,
+            Optional<Long> atVersion,
+            ParquetReaderOptions parquetReaderOptions,
+            boolean checkpointRowStatisticsWritingEnabled,
+            int domainCompactionThreshold)
+            throws IOException
+    {
+        Optional<Long> lastCheckpointVersion = lastCheckpoint.map(LastCheckpoint::getVersion);
+        System.out.println(lastCheckpointVersion);
+        TransactionLogTail transactionLogTail = TransactionLogTail.loadNewTail(fileSystem, tableLocation, lastCheckpointVersion, atVersion);
+
+        return new TableSnapshot(
+                table,
+                lastCheckpoint,
+                transactionLogTail,
+                tableLocation,
+                parquetReaderOptions,
+                checkpointRowStatisticsWritingEnabled,
+                domainCompactionThreshold,
+                transactionLogTail.getMetadataEntry(),
+                transactionLogTail.getProtocolEntry());
+    }
+
     public Optional<TableSnapshot> getUpdatedSnapshot(TrinoFileSystem fileSystem, Optional<Long> toVersion)
             throws IOException
     {

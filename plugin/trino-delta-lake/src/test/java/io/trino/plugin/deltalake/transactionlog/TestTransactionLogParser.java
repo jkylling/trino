@@ -14,6 +14,7 @@
 
 package io.trino.plugin.deltalake.transactionlog;
 
+import io.trino.filesystem.Location;
 import io.trino.filesystem.TrinoFileSystem;
 import io.trino.filesystem.hdfs.HdfsFileSystemFactory;
 import org.junit.jupiter.api.Test;
@@ -21,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import static io.trino.filesystem.Locations.appendPath;
 import static io.trino.plugin.deltalake.DeltaTestingConnectorSession.SESSION;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.getMandatoryCurrentVersion;
+import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.isCheckpoint;
 import static io.trino.plugin.hive.HiveTestUtils.HDFS_ENVIRONMENT;
 import static io.trino.plugin.hive.HiveTestUtils.HDFS_FILE_SYSTEM_STATS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -38,5 +40,13 @@ public class TestTransactionLogParser
         assertThat(getMandatoryCurrentVersion(fileSystem, appendPath(basePath, "simple_table_without_checkpoint"))).isEqualTo(9);
         assertThat(getMandatoryCurrentVersion(fileSystem, appendPath(basePath, "simple_table_ending_on_checkpoint"))).isEqualTo(10);
         assertThat(getMandatoryCurrentVersion(fileSystem, appendPath(basePath, "simple_table_past_checkpoint"))).isEqualTo(11);
+    }
+
+    @Test
+    public void testIsCheckpoint()
+    {
+        assertThat(isCheckpoint(Location.of("s3://arrakis-prod-datasets-118330671040/hive_metastore/ethereum/transactions_0010/_delta_log/00000000000001836839.json"))).isFalse();
+        assertThat(isCheckpoint(Location.of("s3://arrakis-prod-datasets-118330671040/hive_metastore/ethereum/transactions_0010/_delta_log/00000000000001854818.checkpoint.0000000001.0000000002.parquet"))).isTrue();
+        assertThat(isCheckpoint(Location.of("s3://arrakis-prod-datasets-118330671040/hive_metastore/ethereum/transactions_0010/_delta_log/00000000000001854818.checkpoint.parquet"))).isTrue();
     }
 }

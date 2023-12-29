@@ -3467,4 +3467,13 @@ public class TestDeltaLakeConnectorTest
 
         assertUpdate("DROP TABLE " + tableName);
     }
+
+    @Override
+    protected void verifyVersionedQueryFailurePermissible(Exception e)
+    {
+        assertThat(e)
+                .hasMessageMatching("Version pointer type is not supported: .*|" +
+                        "Unsupported type for table version: .*|" +
+                        "Error getting snapshot for .*|");
+    }
 }

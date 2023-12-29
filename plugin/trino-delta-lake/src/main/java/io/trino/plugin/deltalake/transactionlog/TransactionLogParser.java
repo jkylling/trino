@@ -16,10 +16,13 @@ package io.trino.plugin.deltalake.transactionlog;
 import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.annotations.VisibleForTesting;
 import dev.failsafe.Failsafe;
 import dev.failsafe.RetryPolicy;
 import io.airlift.json.ObjectMapperProvider;
 import io.airlift.log.Logger;
+import io.trino.filesystem.FileEntry;
+import io.trino.filesystem.FileIterator;
 import io.trino.filesystem.Location;
 import io.trino.filesystem.TrinoFileSystem;
 import io.trino.filesystem.TrinoInputFile;
@@ -36,6 +39,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -47,9 +51,14 @@ import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.ResolverStyle;
 import java.time.format.SignStyle;
 import java.time.temporal.ChronoField;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static com.google.common.base.Verify.verify;
 import static com.google.common.math.LongMath.divide;
@@ -76,6 +85,7 @@ import static java.lang.Double.parseDouble;
 import static java.lang.Float.floatToRawIntBits;
 import static java.lang.Float.parseFloat;
 import static java.lang.Integer.parseInt;
+import static java.lang.Long.max;
 import static java.lang.Long.parseLong;
 import static java.lang.String.format;
 import static java.math.RoundingMode.UNNECESSARY;
@@ -244,6 +254,77 @@ public final class TransactionLogParser
                         })
                         .build())
                 .get(() -> tryReadLastCheckpoint(fileSystem, tableLocation));
+    }
+
+    static Optional<LastCheckpoint> readLastCheckpoint(TrinoFileSystem fileSystem, String tableLocation, Optional<Long> atVersion)
+            throws IOException
+    {
+        if (atVersion.isEmpty()) {
+            return readLastCheckpoint(fileSystem, tableLocation);
+        }
+        Location transactionLogDir = Location.of(getTransactionLogDir(tableLocation));
+        long topVersion = atVersion.orElseThrow() + 1;
+        // TODO: Avoid looping to topVersion = 0 if we are beyond the retention period (i.e., detect if delta log is not contiguous)
+        // This optimizes for blob stores. File systems without optimized listFilesAfter will suffer
+        while (topVersion > 0) {
+            Location topLocation = transactionLogDir.appendPath("%020d".formatted(topVersion));
+            // 490 to optimize for expected content of 1000 listed items in Databricks Delta log with .json, .crc and checkpoint files
+            long bottomVersion = max(0, topVersion - 490L);
+
+            Location bottomLocation = transactionLogDir.appendPath("%020d".formatted(bottomVersion));
+
+            FileIterator iterator = fileSystem.listFilesAfter(transactionLogDir, bottomLocation);
+            List<FileEntry> checkpoints = new ArrayList<>();
+            while (iterator.hasNext()) {
+                FileEntry entry = iterator.next();
+                if (entry.location().path().compareTo(topLocation.path()) >= 0) {
+                    break;
+                }
+                if (isCheckpoint(entry.location())) {
+                    checkpoints.add(entry);
+                }
+            }
+            Optional<LastCheckpoint> checkpoint = extractLastCheckpoint(checkpoints);
+            if (checkpoint.isPresent()) {
+                return checkpoint;
+            }
+            topVersion = bottomVersion;
+        }
+        return Optional.empty();
+    }
+
+    @VisibleForTesting
+    public static Optional<LastCheckpoint> extractLastCheckpoint(List<FileEntry> checkpoints)
+    {
+        if (checkpoints.isEmpty()) {
+            return Optional.empty();
+        }
+
+        FileEntry first = checkpoints.stream().max(Comparator.comparing((FileEntry k) -> k.location().path())).orElseThrow();
+        Pattern singlePart = Pattern.compile("^(?<version>\\d{20}+)\\.checkpoint\\.parquet$");
+        Pattern multiPart = Pattern.compile("^(?<version>\\d{20}+)\\.checkpoint\\.(?<partNo>\\d{10}+)\\.(?<parts>\\d{10}+)\\.parquet$");
+
+        Matcher singleMatcher = singlePart.matcher(first.location().fileName());
+        if (singleMatcher.matches()) {
+            return Optional.of(new LastCheckpoint(Long.parseLong(singleMatcher.group("version")),
+                    BigInteger.ZERO, // TODO: Size is hard coded since it's unused
+                    Optional.empty()));
+        }
+        Matcher multiMatcher = multiPart.matcher(first.location().fileName());
+        if (multiMatcher.matches()) {
+            return Optional.of(new LastCheckpoint(Long.parseLong(multiMatcher.group("version")),
+                    BigInteger.ZERO, // TODO: Size is hard coded since it's unused
+                    Optional.of(Integer.parseInt(multiMatcher.group("parts")))));
+        }
+        throw new RuntimeException();
+    }
+
+    private static final Pattern checkpointRegex = Pattern.compile("\\d{20}+\\.checkpoint(\\.(?<partNo>\\d{10}+)\\.(?<parts>\\d{10}+))?\\.parquet");
+
+    @VisibleForTesting
+    public static boolean isCheckpoint(Location location)
+    {
+        return checkpointRegex.matcher(location.fileName()).matches();
     }
 
     private static Optional<LastCheckpoint> tryReadLastCheckpoint(TrinoFileSystem fileSystem, String tableLocation)

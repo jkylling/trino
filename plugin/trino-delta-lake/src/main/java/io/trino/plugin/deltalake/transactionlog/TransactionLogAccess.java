@@ -191,6 +191,57 @@ public class TransactionLogAccess
         return snapshot;
     }
 
+    public TableSnapshot loadSnapshot(ConnectorSession session, SchemaTableName table, String tableLocation, Optional<Long> atVersion)
+            throws IOException
+    {
+        if (atVersion.isPresent()) { // bypass cache if reading at a version
+            TrinoFileSystem fileSystem = fileSystemFactory.create(session);
+            Optional<LastCheckpoint> lastCheckpoint = readLastCheckpoint(fileSystem, tableLocation, atVersion);
+            return TableSnapshot.load(
+                    table,
+                    lastCheckpoint,
+                    fileSystem,
+                    tableLocation,
+                    atVersion,
+                    parquetReaderOptions,
+                    checkpointRowStatisticsWritingEnabled,
+                    domainCompactionThreshold);
+        }
+        TableLocation cacheKey = new TableLocation(table, tableLocation);
+        TableSnapshot cachedSnapshot = tableSnapshots.getIfPresent(cacheKey);
+        TableSnapshot snapshot;
+        TrinoFileSystem fileSystem = fileSystemFactory.create(session);
+        if (cachedSnapshot == null) {
+            try {
+                Optional<LastCheckpoint> lastCheckpoint = readLastCheckpoint(fileSystem, tableLocation);
+                snapshot = tableSnapshots.get(cacheKey, () ->
+                        TableSnapshot.load(
+                                table,
+                                lastCheckpoint,
+                                fileSystem,
+                                tableLocation,
+                                parquetReaderOptions,
+                                checkpointRowStatisticsWritingEnabled,
+                                domainCompactionThreshold));
+            }
+            catch (UncheckedExecutionException | ExecutionException e) {
+                throwIfUnchecked(e.getCause());
+                throw new RuntimeException(e);
+            }
+        }
+        else {
+            Optional<TableSnapshot> updatedSnapshot = cachedSnapshot.getUpdatedSnapshot(fileSystem, Optional.empty());
+            if (updatedSnapshot.isPresent()) {
+                snapshot = updatedSnapshot.get();
+                tableSnapshots.asMap().replace(cacheKey, cachedSnapshot, snapshot);
+            }
+            else {
+                snapshot = cachedSnapshot;
+            }
+        }
+        return snapshot;
+    }
+
     public void flushCache()
     {
         tableSnapshots.invalidateAll();
