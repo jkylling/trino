@@ -110,6 +110,17 @@ final class TracingFileSystem
     }
 
     @Override
+    public FileIterator listFilesAfter(Location location, Location startAfter)
+            throws IOException
+    {
+        Span span = tracer.spanBuilder("FileSystem.listFilesAfter")
+                .setAttribute(FileSystemAttributes.FILE_LOCATION, location.toString())
+                .setAttribute(FileSystemAttributes.FILE_LOCATION, startAfter.toString())
+                .startSpan();
+        return withTracing(span, () -> delegate.listFilesAfter(location, startAfter));
+    }
+
+    @Override
     public Optional<Boolean> directoryExists(Location location)
             throws IOException
     {

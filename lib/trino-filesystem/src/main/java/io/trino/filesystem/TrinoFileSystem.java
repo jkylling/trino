@@ -154,6 +154,16 @@ public interface TrinoFileSystem
             throws IOException;
 
     /**
+     * Returns an iterator listing files whose path is strictly greater than startAfter with the same semantics as for listFiles.
+     * The files are returned in lexicographically increasing order. Only the native blob filesystems have optimized implementations.
+     */
+    default FileIterator listFilesAfter(Location location, Location startAfter)
+            throws IOException
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
      * Checks if a directory exists at the specified location. For all file system types,
      * this returns <tt>true</tt> if the location is empty (the root of the file system)
      * or if any files exist within the directory, as determined by {@link #listFiles(Location)}.

@@ -98,6 +98,13 @@ public final class CacheFileSystem
     }
 
     @Override
+    public FileIterator listFilesAfter(Location location, Location startAfter)
+            throws IOException
+    {
+        return delegate.listFilesAfter(location, startAfter);
+    }
+
+    @Override
     public Optional<Boolean> directoryExists(Location location)
             throws IOException
     {

@@ -111,6 +111,13 @@ final class SwitchingFileSystem
     }
 
     @Override
+    public FileIterator listFilesAfter(Location location, Location startAfter)
+            throws IOException
+    {
+        return fileSystem(location).listFilesAfter(location, startAfter);
+    }
+
+    @Override
     public Optional<Boolean> directoryExists(Location location)
             throws IOException
     {
