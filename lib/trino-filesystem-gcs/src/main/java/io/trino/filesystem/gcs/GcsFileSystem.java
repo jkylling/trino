@@ -165,6 +165,23 @@ public class GcsFileSystem
         }
     }
 
+    @Override
+    public FileIterator listFilesAfter(Location location, Location startAfter)
+            throws IOException
+    {
+        if (!(startAfter.path().startsWith(location.path()))) {
+            throw new IllegalArgumentException();
+        }
+        GcsLocation gcsLocation = new GcsLocation(normalizeToDirectory(location));
+        GcsLocation gcsStartAfter = new GcsLocation(startAfter);
+        try {
+            return new GcsFileIterator(gcsLocation, getPage(gcsLocation, BlobListOption.startOffset(gcsStartAfter.path() + "\00")));
+        }
+        catch (RuntimeException e) {
+            throw handleGcsException(e, "listing files", gcsLocation);
+        }
+    }
+
     private static Location normalizeToDirectory(Location location)
     {
         String path = location.path();
