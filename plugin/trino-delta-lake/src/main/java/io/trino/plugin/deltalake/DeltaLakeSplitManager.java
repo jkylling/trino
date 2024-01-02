@@ -143,7 +143,7 @@ public class DeltaLakeSplitManager
     public ConnectorSplitSource getSplits(ConnectorTransactionHandle transaction, ConnectorSession session, ConnectorTableFunctionHandle function)
     {
         if (function instanceof TableChangesTableFunctionHandle tableFunctionHandle) {
-            return new TableChangesSplitSource(session, fileSystemFactory, tableFunctionHandle);
+            return new TableChangesSplitSource(session, fileSystemFactory, tableFunctionHandle, executor, maxSplitsPerSecond, maxOutstandingSplits);
         }
         throw new UnsupportedOperationException("Unrecognized function: " + function);
     }
