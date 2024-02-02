@@ -19,15 +19,19 @@ import com.google.common.collect.ImmutableMultiset;
 import com.google.common.collect.Multiset;
 import io.airlift.slice.Slices;
 import io.airlift.units.DataSize;
+import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import io.trino.filesystem.Location;
-import io.trino.filesystem.TrackingFileSystemFactory;
-import io.trino.filesystem.TrackingFileSystemFactory.OperationType;
 import io.trino.filesystem.TrinoInput;
 import io.trino.filesystem.TrinoInputFile;
 import io.trino.filesystem.cache.CacheFileSystem;
 import io.trino.filesystem.cache.DefaultCacheKeyProvider;
 import io.trino.filesystem.memory.MemoryFileSystemFactory;
+import io.trino.filesystem.tracing.InputFileMethod;
+import io.trino.filesystem.tracing.TracingFileSystemFactory;
 import io.trino.spi.security.ConnectorIdentity;
+import io.trino.util.AutoCloseableCloser;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -41,11 +45,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 
-import static io.trino.filesystem.TrackingFileSystemFactory.OperationType.INPUT_FILE_GET_LENGTH;
-import static io.trino.filesystem.TrackingFileSystemFactory.OperationType.INPUT_FILE_LAST_MODIFIED;
-import static io.trino.filesystem.TrackingFileSystemFactory.OperationType.INPUT_FILE_NEW_STREAM;
 import static io.trino.filesystem.alluxio.TestingAlluxioFileSystemCache.OperationType.CACHE_READ;
 import static io.trino.filesystem.alluxio.TestingAlluxioFileSystemCache.OperationType.EXTERNAL_READ;
+import static io.trino.filesystem.cache.TestCacheFileSystemAccessOperations.TRACE_PREFIX;
+import static io.trino.filesystem.tracing.FileSystemAttributes.FILE_LOCATION;
+import static io.trino.filesystem.tracing.InputFileMethod.INPUT_FILE_LAST_MODIFIED;
+import static io.trino.filesystem.tracing.InputFileMethod.INPUT_FILE_LENGTH;
+import static io.trino.filesystem.tracing.InputFileMethod.INPUT_FILE_NEW_INPUT;
+import static io.trino.filesystem.tracing.InputFileMethod.fromMethodName;
 import static io.trino.testing.MultisetAssertions.assertMultisetsEqual;
 import static java.util.Collections.nCopies;
 import static java.util.stream.Collectors.toCollection;
@@ -57,10 +64,11 @@ public class TestAlluxioCacheFileSystemAccessOperations
     private static final int CACHE_SIZE = 1024;
     private static final int PAGE_SIZE = 128;
 
-    private TrackingFileSystemFactory trackingFileSystemFactory;
     private TestingAlluxioFileSystemCache alluxioCache;
     private CacheFileSystem fileSystem;
     private Path tempDirectory;
+    private InMemorySpanExporter spanExporter;
+    private AutoCloseableCloser closer;
 
     @BeforeAll
     public void setUp()
@@ -76,16 +84,22 @@ public class TestAlluxioCacheFileSystemAccessOperations
                 .setMaxCacheSizes(DataSize.ofBytes(CACHE_SIZE).toBytesValueString());
         AlluxioConfiguration alluxioConfiguration = AlluxioFileSystemCacheModule.getAlluxioConfiguration(configuration);
 
-        trackingFileSystemFactory = new TrackingFileSystemFactory(new MemoryFileSystemFactory());
+        closer = AutoCloseableCloser.create();
+        spanExporter = closer.register(InMemorySpanExporter.create());
+        SdkTracerProvider tracerProvider = closer.register(SdkTracerProvider.builder()
+                .addSpanProcessor(SimpleSpanProcessor.create(spanExporter))
+                .build());
+        TracingFileSystemFactory tracingFileSystemFactory = new TracingFileSystemFactory(tracerProvider.get("fs"), new MemoryFileSystemFactory());
         alluxioCache = new TestingAlluxioFileSystemCache(alluxioConfiguration, new DefaultCacheKeyProvider());
-        fileSystem = new CacheFileSystem(trackingFileSystemFactory.create(ConnectorIdentity.ofUser("hello")),
+        fileSystem = new CacheFileSystem(tracingFileSystemFactory.create(ConnectorIdentity.ofUser("hello")),
                 alluxioCache, alluxioCache.getCacheKeyProvider());
     }
 
     @AfterAll
     public void tearDown()
+            throws Exception
     {
-        trackingFileSystemFactory = null;
+        closer.close();
         fileSystem = null;
         tempDirectory.toFile().delete();
         tempDirectory = null;
@@ -103,8 +117,8 @@ public class TestAlluxioCacheFileSystemAccessOperations
 
         assertReadOperations(location, content,
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_NEW_STREAM))
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
@@ -112,7 +126,7 @@ public class TestAlluxioCacheFileSystemAccessOperations
                         .build());
         assertReadOperations(location, content,
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
@@ -128,8 +142,8 @@ public class TestAlluxioCacheFileSystemAccessOperations
         alluxioCache.clear();
         assertReadOperations(location, modifiedContent,
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_NEW_STREAM))
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
@@ -152,8 +166,8 @@ public class TestAlluxioCacheFileSystemAccessOperations
 
         assertSizedReadOperations(location, Arrays.copyOf(content, PAGE_SIZE),
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_NEW_STREAM))
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheReadOperation>builder()
@@ -163,8 +177,8 @@ public class TestAlluxioCacheFileSystemAccessOperations
 
         assertSizedReadOperations(location, Arrays.copyOf(content, PAGE_SIZE + 10),
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
-                        .add(new FileOperation(location, INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_NEW_INPUT))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheReadOperation>builder()
@@ -174,7 +188,7 @@ public class TestAlluxioCacheFileSystemAccessOperations
 
         assertSizedReadOperations(location, Arrays.copyOf(content, PAGE_SIZE + 10),
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheReadOperation>builder()
@@ -183,7 +197,7 @@ public class TestAlluxioCacheFileSystemAccessOperations
 
         assertSizedReadOperations(location, content,
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheReadOperation>builder()
@@ -206,8 +220,8 @@ public class TestAlluxioCacheFileSystemAccessOperations
 
         assertSizedReadOperations(location, Arrays.copyOf(content, PAGE_SIZE + 1),
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_NEW_STREAM))
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheReadOperation>builder()
@@ -217,7 +231,7 @@ public class TestAlluxioCacheFileSystemAccessOperations
 
         assertSizedReadOperations(location, Arrays.copyOf(content, 2 * PAGE_SIZE),
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheReadOperation>builder()
@@ -275,7 +289,7 @@ public class TestAlluxioCacheFileSystemAccessOperations
     {
         assertReadOperations(location,
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
@@ -288,8 +302,8 @@ public class TestAlluxioCacheFileSystemAccessOperations
     {
         assertReadOperations(location,
                 ImmutableMultiset.<FileOperation>builder()
-                        .add(new FileOperation(location, INPUT_FILE_NEW_STREAM))
-                        .add(new FileOperation(location, INPUT_FILE_GET_LENGTH))
+                        .add(new FileOperation(location, INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(location, INPUT_FILE_LENGTH))
                         .add(new FileOperation(location, INPUT_FILE_LAST_MODIFIED))
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
@@ -302,7 +316,7 @@ public class TestAlluxioCacheFileSystemAccessOperations
     {
         TrinoInputFile file = fileSystem.newInputFile(location);
         int length = (int) file.length();
-        trackingFileSystemFactory.reset();
+        spanExporter.reset();
         alluxioCache.reset();
         try (TrinoInput input = file.newInput()) {
             input.readFully(0, length);
@@ -315,8 +329,8 @@ public class TestAlluxioCacheFileSystemAccessOperations
             throws IOException
     {
         TrinoInputFile file = fileSystem.newInputFile(location);
-        int length = content.length; //saturatedCast(file.length());
-        trackingFileSystemFactory.reset();
+        int length = content.length;
+        spanExporter.reset();
         alluxioCache.reset();
         try (TrinoInput input = file.newInput()) {
             assertThat(input.readFully(0, length)).isEqualTo(Slices.wrappedBuffer(content));
@@ -329,8 +343,8 @@ public class TestAlluxioCacheFileSystemAccessOperations
             throws IOException
     {
         TrinoInputFile file = fileSystem.newInputFile(location);
-        int length = content.length; //saturatedCast(file.length());
-        trackingFileSystemFactory.reset();
+        int length = content.length;
+        spanExporter.reset();
         alluxioCache.reset();
         try (TrinoInput input = file.newInput()) {
             assertThat(input.readFully(0, length)).isEqualTo(Slices.wrappedBuffer(content));
@@ -341,11 +355,11 @@ public class TestAlluxioCacheFileSystemAccessOperations
 
     private Multiset<FileOperation> getOperations()
     {
-        return trackingFileSystemFactory.getOperationCounts()
-                .entrySet().stream()
-                .flatMap(entry -> nCopies(entry.getValue(), new FileOperation(
-                        entry.getKey().location(),
-                        entry.getKey().operationType())).stream())
+        return spanExporter.getFinishedSpanItems().stream()
+                .filter(span -> span.getName().startsWith(TRACE_PREFIX))
+                .map(span -> new FileOperation(
+                        Location.of(span.getAttributes().get(FILE_LOCATION)),
+                        fromMethodName(span.getName())))
                 .collect(toCollection(HashMultiset::create));
     }
 
@@ -369,7 +383,7 @@ public class TestAlluxioCacheFileSystemAccessOperations
                 .collect(toCollection(HashMultiset::create));
     }
 
-    private record FileOperation(Location path, OperationType operationType) {}
+    private record FileOperation(Location path, InputFileMethod operationType) {}
 
     private record CacheOperation(Location path, TestingAlluxioFileSystemCache.OperationType operationType) {}
 

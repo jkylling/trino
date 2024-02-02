@@ -16,9 +16,9 @@ package io.trino.plugin.deltalake;
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.ImmutableMultiset;
 import com.google.common.collect.Multiset;
+import com.google.inject.Key;
+import io.opentelemetry.api.trace.Tracer;
 import io.trino.Session;
-import io.trino.filesystem.TrackingFileSystemFactory;
-import io.trino.filesystem.TrackingFileSystemFactory.OperationType;
 import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.filesystem.alluxio.AlluxioFileSystemCacheConfig;
 import io.trino.filesystem.alluxio.AlluxioFileSystemCacheModule;
@@ -27,6 +27,8 @@ import io.trino.filesystem.cache.CacheFileSystemFactory;
 import io.trino.filesystem.cache.CachingHostAddressProvider;
 import io.trino.filesystem.cache.NoneCachingHostAddressProvider;
 import io.trino.filesystem.hdfs.HdfsFileSystemFactory;
+import io.trino.filesystem.tracing.InputFileMethod;
+import io.trino.filesystem.tracing.TracingFileSystemFactory;
 import io.trino.plugin.deltalake.cache.DeltaLakeCacheKeyProvider;
 import io.trino.testing.AbstractTestQueryFramework;
 import io.trino.testing.DistributedQueryRunner;
@@ -43,10 +45,14 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static com.google.inject.Scopes.SINGLETON;
-import static io.trino.filesystem.TrackingFileSystemFactory.OperationType.INPUT_FILE_GET_LENGTH;
-import static io.trino.filesystem.TrackingFileSystemFactory.OperationType.INPUT_FILE_NEW_STREAM;
 import static io.trino.filesystem.alluxio.TestingAlluxioFileSystemCache.OperationType.CACHE_READ;
 import static io.trino.filesystem.alluxio.TestingAlluxioFileSystemCache.OperationType.EXTERNAL_READ;
+import static io.trino.filesystem.cache.TestCacheFileSystemAccessOperations.TRACE_PREFIX;
+import static io.trino.filesystem.tracing.FileSystemAttributes.FILE_LOCATION;
+import static io.trino.filesystem.tracing.InputFileMethod.INPUT_FILE_LENGTH;
+import static io.trino.filesystem.tracing.InputFileMethod.INPUT_FILE_NEW_INPUT;
+import static io.trino.filesystem.tracing.InputFileMethod.INPUT_FILE_NEW_STREAM;
+import static io.trino.filesystem.tracing.InputFileMethod.fromMethodName;
 import static io.trino.plugin.base.util.Closables.closeAllSuppress;
 import static io.trino.plugin.deltalake.TestDeltaLakeAlluxioCacheFileOperations.FileType.CDF_DATA;
 import static io.trino.plugin.deltalake.TestDeltaLakeAlluxioCacheFileOperations.FileType.CHECKPOINT;
@@ -62,12 +68,11 @@ import static java.util.Collections.nCopies;
 import static java.util.Objects.requireNonNull;
 import static java.util.stream.Collectors.toCollection;
 
-// single-threaded AccessTrackingFileSystemFactory is shared mutable state
+// single-threaded as trace spans are shared mutable state
 @Execution(ExecutionMode.SAME_THREAD)
 public class TestDeltaLakeAlluxioCacheFileOperations
         extends AbstractTestQueryFramework
 {
-    private TrackingFileSystemFactory trackingFileSystemFactory;
     private TestingAlluxioFileSystemCache alluxioFileSystemCache;
 
     @Override
@@ -82,13 +87,14 @@ public class TestDeltaLakeAlluxioCacheFileOperations
                 .build();
         try {
             File metastoreDirectory = queryRunner.getCoordinator().getBaseDataDir().resolve("delta_lake_metastore").toFile().getAbsoluteFile();
-            trackingFileSystemFactory = new TrackingFileSystemFactory(new HdfsFileSystemFactory(HDFS_ENVIRONMENT, HDFS_FILE_SYSTEM_STATS));
+            Tracer tracer = queryRunner.getCoordinator().getInstance(Key.get(Tracer.class));
+            TracingFileSystemFactory tracingFileSystemFactory = new TracingFileSystemFactory(tracer, new HdfsFileSystemFactory(HDFS_ENVIRONMENT, HDFS_FILE_SYSTEM_STATS));
             AlluxioFileSystemCacheConfig alluxioFileSystemCacheConfiguration = new AlluxioFileSystemCacheConfig()
                     .setCacheDirectories(metastoreDirectory.getAbsolutePath() + "/cache")
                     .disableTTL()
                     .setMaxCacheSizes("100MB");
             alluxioFileSystemCache = new TestingAlluxioFileSystemCache(AlluxioFileSystemCacheModule.getAlluxioConfiguration(alluxioFileSystemCacheConfiguration), new DeltaLakeCacheKeyProvider());
-            TrinoFileSystemFactory fileSystemFactory = new CacheFileSystemFactory(trackingFileSystemFactory, alluxioFileSystemCache, alluxioFileSystemCache.getCacheKeyProvider());
+            TrinoFileSystemFactory fileSystemFactory = new CacheFileSystemFactory(tracingFileSystemFactory, alluxioFileSystemCache, alluxioFileSystemCache.getCacheKeyProvider());
 
             Path dataDirectory = queryRunner.getCoordinator().getBaseDataDir().resolve("delta_lake_data");
             queryRunner.installPlugin(new TestingDeltaLakePlugin(dataDirectory, Optional.empty(), Optional.of(fileSystemFactory), binder -> binder.bind(CachingHostAddressProvider.class).to(NoneCachingHostAddressProvider.class).in(SINGLETON)));
@@ -121,31 +127,31 @@ public class TestDeltaLakeAlluxioCacheFileOperations
         assertFileSystemAccesses(
                 "SELECT * FROM test_cache_file_operations",
                 ImmutableMultiset.<FileOperation>builder()
-                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000000.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000001.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p1/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p2/", INPUT_FILE_NEW_STREAM), 1)
+                        .add(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000000.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000001.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(DATA, "key=p1/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p2/", INPUT_FILE_NEW_INPUT))
                         // All data cached when reading parquet file footers to collect statistics when writing
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p1/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p2/"), 1)
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p1/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p2/"))
                         .build());
         assertFileSystemAccesses(
                 "SELECT * FROM test_cache_file_operations",
                 ImmutableMultiset.<FileOperation>builder()
-                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000000.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000001.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM), 1)
+                        .add(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000000.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000001.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM))
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p1/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p2/"), 1)
+                        .add(new CacheOperation(CACHE_READ, "key=p1/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p2/"))
                         .build());
         assertUpdate("INSERT INTO test_cache_file_operations VALUES ('p3', '3-xyz')", 1);
         assertUpdate("INSERT INTO test_cache_file_operations VALUES ('p4', '4-xyz')", 1);
@@ -154,46 +160,46 @@ public class TestDeltaLakeAlluxioCacheFileOperations
         assertFileSystemAccesses(
                 "SELECT * FROM test_cache_file_operations",
                 ImmutableMultiset.<FileOperation>builder()
-                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000000.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000001.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000004.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000005.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000006.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p1/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p2/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p3/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p4/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p5/", INPUT_FILE_NEW_STREAM), 1)
+                        .add(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000000.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000001.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000004.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000005.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000006.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(DATA, "key=p1/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p2/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p3/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p4/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p5/", INPUT_FILE_NEW_INPUT))
                         // All data cached when reading parquet file footers to collect statistics when writing
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p1/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p2/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p3/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p4/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p5/"), 1)
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p1/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p2/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p3/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p4/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p5/"))
                         .build());
         assertFileSystemAccesses(
                 "SELECT * FROM test_cache_file_operations",
                 ImmutableMultiset.<FileOperation>builder()
-                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000000.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000001.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000004.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000005.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000006.json", INPUT_FILE_NEW_STREAM), 1)
+                        .add(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000000.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000001.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000004.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000005.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000006.json", INPUT_FILE_NEW_STREAM))
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p1/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p2/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p3/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p4/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p5/"), 1)
+                        .add(new CacheOperation(CACHE_READ, "key=p1/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p2/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p3/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p4/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p5/"))
                         .build());
     }
 
@@ -209,29 +215,29 @@ public class TestDeltaLakeAlluxioCacheFileOperations
         assertFileSystemAccesses(
                 "SELECT * FROM test_checkpoint_file_operations",
                 ImmutableMultiset.<FileOperation>builder()
-                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000002.checkpoint.parquet", INPUT_FILE_NEW_STREAM), 2)
-                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000002.checkpoint.parquet", INPUT_FILE_GET_LENGTH), 4)
-                        .addCopies(new FileOperation(DATA, "key=p1/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p2/", INPUT_FILE_NEW_STREAM), 1)
+                        .add(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM))
+                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000002.checkpoint.parquet", INPUT_FILE_NEW_INPUT), 2)
+                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000002.checkpoint.parquet", INPUT_FILE_LENGTH), 4)
+                        .add(new FileOperation(DATA, "key=p1/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p2/", INPUT_FILE_NEW_INPUT))
                         // All data cached when reading parquet file footers to collect statistics when writing
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p1/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p2/"), 1)
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p1/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p2/"))
                         .build());
         assertFileSystemAccesses(
                 "SELECT * FROM test_checkpoint_file_operations",
                 ImmutableMultiset.<FileOperation>builder()
                         .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM), 1)
                         .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000003.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000002.checkpoint.parquet", INPUT_FILE_NEW_STREAM), 2)
-                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000002.checkpoint.parquet", INPUT_FILE_GET_LENGTH), 4)
+                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000002.checkpoint.parquet", INPUT_FILE_NEW_INPUT), 2)
+                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000002.checkpoint.parquet", INPUT_FILE_LENGTH), 4)
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p1/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p2/"), 1)
+                        .add(new CacheOperation(CACHE_READ, "key=p1/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p2/"))
                         .build());
         assertUpdate("INSERT INTO test_checkpoint_file_operations VALUES ('p3', '3-xyz')", 1);
         assertUpdate("INSERT INTO test_checkpoint_file_operations VALUES ('p4', '4-xyz')", 1);
@@ -240,40 +246,40 @@ public class TestDeltaLakeAlluxioCacheFileOperations
         assertFileSystemAccesses(
                 "SELECT * FROM test_checkpoint_file_operations",
                 ImmutableMultiset.<FileOperation>builder()
-                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000005.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000006.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000004.checkpoint.parquet", INPUT_FILE_NEW_STREAM), 2)
-                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000004.checkpoint.parquet", INPUT_FILE_GET_LENGTH), 4)
-                        .addCopies(new FileOperation(DATA, "key=p1/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p2/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p3/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p4/", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(DATA, "key=p5/", INPUT_FILE_NEW_STREAM), 1)
+                        .add(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000005.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000006.json", INPUT_FILE_NEW_STREAM))
+                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000004.checkpoint.parquet", INPUT_FILE_NEW_INPUT), 2)
+                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000004.checkpoint.parquet", INPUT_FILE_LENGTH), 4)
+                        .add(new FileOperation(DATA, "key=p1/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p2/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p3/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p4/", INPUT_FILE_NEW_INPUT))
+                        .add(new FileOperation(DATA, "key=p5/", INPUT_FILE_NEW_INPUT))
                         // All data cached when reading parquet file footers to collect statistics when writing
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p1/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p2/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p3/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p4/"), 1)
-                        .addCopies(new CacheOperation(EXTERNAL_READ, "key=p5/"), 1)
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p1/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p2/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p3/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p4/"))
+                        .add(new CacheOperation(EXTERNAL_READ, "key=p5/"))
                         .build());
         assertFileSystemAccesses(
                 "SELECT * FROM test_checkpoint_file_operations",
                 ImmutableMultiset.<FileOperation>builder()
-                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000005.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000006.json", INPUT_FILE_NEW_STREAM), 1)
-                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000004.checkpoint.parquet", INPUT_FILE_NEW_STREAM), 2)
-                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000004.checkpoint.parquet", INPUT_FILE_GET_LENGTH), 4)
+                        .add(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000005.json", INPUT_FILE_NEW_STREAM))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000006.json", INPUT_FILE_NEW_STREAM))
+                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000004.checkpoint.parquet", INPUT_FILE_NEW_INPUT), 2)
+                        .addCopies(new FileOperation(CHECKPOINT, "00000000000000000004.checkpoint.parquet", INPUT_FILE_LENGTH), 4)
                         .build(),
                 ImmutableMultiset.<CacheOperation>builder()
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p1/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p2/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p3/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p4/"), 1)
-                        .addCopies(new CacheOperation(CACHE_READ, "key=p5/"), 1)
+                        .add(new CacheOperation(CACHE_READ, "key=p1/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p2/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p3/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p4/"))
+                        .add(new CacheOperation(CACHE_READ, "key=p5/"))
                         .build());
     }
 
@@ -281,7 +287,6 @@ public class TestDeltaLakeAlluxioCacheFileOperations
     {
         assertUpdate("CALL system.flush_metadata_cache()");
         DistributedQueryRunner queryRunner = getDistributedQueryRunner();
-        trackingFileSystemFactory.reset();
         alluxioFileSystemCache.reset();
         queryRunner.executeWithPlan(queryRunner.getDefaultSession(), query);
         assertMultisetsEqual(getOperations(), expectedAccesses);
@@ -324,21 +329,20 @@ public class TestDeltaLakeAlluxioCacheFileOperations
 
     private Multiset<FileOperation> getOperations()
     {
-        return trackingFileSystemFactory.getOperationCounts()
-                .entrySet().stream()
-                .filter(entry -> {
-                    String path = entry.getKey().location().path();
+        return getQueryRunner().getSpans().stream()
+                .filter(span -> span.getName().startsWith(TRACE_PREFIX))
+                .filter(span -> {
+                    String path = span.getAttributes().get(FILE_LOCATION);
                     return !path.endsWith(".trinoSchema") && !path.contains(".trinoPermissions");
                 })
-                .flatMap(entry -> nCopies(entry.getValue(), FileOperation.create(
-                        entry.getKey().location().path(),
-                        entry.getKey().operationType())).stream())
+                .map(span -> FileOperation.create(requireNonNull(span.getAttributes().get(FILE_LOCATION)),
+                                fromMethodName(span.getName())))
                 .collect(toCollection(HashMultiset::create));
     }
 
-    private record FileOperation(FileType fileType, String fileId, OperationType operationType)
+    private record FileOperation(FileType fileType, String fileId, InputFileMethod operationType)
     {
-        public static FileOperation create(String path, OperationType operationType)
+        public static FileOperation create(String path, InputFileMethod operationType)
         {
             String fileName = path.replaceFirst(".*/", "");
             if (path.matches(".*/_delta_log/_last_checkpoint")) {
