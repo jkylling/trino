@@ -104,7 +104,10 @@ public final class Standard
     @Override
     public void extendEnvironment(Environment.Builder builder)
     {
-        builder.addContainers(createTrinoCoordinator(), createTestsContainer());
+        DockerContainer jaeger = new DockerContainer("jaegertracing/all-in-one:latest", "jaeger")
+                .withNetworkAliases("jaeger" + ".docker.cluster");
+        portBinder.exposePort(jaeger, 16686);
+        builder.addContainers(jaeger, createTrinoCoordinator(), createTestsContainer());
         // default catalogs copied from /docker/presto-product-tests
         builder.addConnector("blackhole");
         builder.addConnector("jmx");
